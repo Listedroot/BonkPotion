@@ -1,0 +1,22 @@
+name: BonkPotion
+version: 1.0
+main: me.listed.bonkpotion.BonkPotion
+authors: [Listed]
+description: A plugin to stack potions in player's inventory. made for The BonkNetwork
+api-version: '1.21'
+commands:
+  potionstack:
+    description: Stack potions in your inventory
+    usage: /potionstack
+    permission: bonkpotion.use
+  bonkpotion:
+    description: Reload the plugin configuration
+    usage: /bonkpotion reload
+    permission: bonkpotion.admin
+permissions:
+  bonkpotion.use:
+    description: Allows the player to use the /potionstack command
+    default: true
+  bonkpotion.admin:
+    description: Allows the player to reload the plugin configuration
+    default: op

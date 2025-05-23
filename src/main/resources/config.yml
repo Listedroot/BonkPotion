@@ -1,0 +1,13 @@
+# BonkPotion Configuration
+
+# Maximum number of potions to stack in one command use
+# Set to -1 for no limit
+max-potions-to-stack: 64
+
+# Message when potions are stacked (:
+messages:
+  no-permission: "&cYou don't have permission to use this command!"
+  no-potions: "&eNo potions to stack found in your inventory!"
+  stacked: "&aStacked &e%count% potions&a in your inventory!"
+  reloaded: "&aConfiguration reloaded successfully!"
+  in-progress: "&cPlease wait until the current operation is complete!"
