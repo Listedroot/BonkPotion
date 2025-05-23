@@ -3,31 +3,93 @@ package me.listed.bonkpotion;
 import org.bukkit.Bukkit;
 import org.bukkit.Material;
 import org.bukkit.configuration.file.FileConfiguration;
-import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.inventory.meta.PotionMeta;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.potion.PotionData;
+import org.bukkit.potion.PotionEffect;
+import org.bukkit.potion.PotionEffectType;
 import org.bukkit.scheduler.BukkitRunnable;
+import org.jetbrains.annotations.NotNull;
 
-import java.io.File;
-import java.io.IOException;
+import java.lang.reflect.Method;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Level;
 
-public class BonkPotion extends JavaPlugin {
+public final class BonkPotion extends JavaPlugin {
     
-    private File configFile;
+    // Reflection cache for version compatibility
+    private static Method getBasePotionDataMethod;
+    private static Method getEffectsMethod;
+    static {
+        try {
+            // Try to get methods for different versions
+            getBasePotionDataMethod = PotionMeta.class.getMethod("getBasePotionData");
+            getEffectsMethod = PotionMeta.class.getMethod("getCustomEffects");
+        } catch (NoSuchMethodException e) {
+            // Fallback to modern API if methods not found
+            getBasePotionDataMethod = null;
+            getEffectsMethod = null;
+        }
+    }
+    
     private FileConfiguration config;
     private int maxPotionsToStack;
-    private final Set<UUID> processingPlayers = Collections.synchronizedSet(new HashSet<>());
+    private final Set<UUID> processingPlayers = Collections.newSetFromMap(new ConcurrentHashMap<>());
+    private static final Set<String> POTION_MATERIALS = new HashSet<>();
     
     @Override
     public void onEnable() {
-        // Create config if it doesn't exist
-        saveDefaultConfig();
+        // Initialize potion materials set
+        initializePotionMaterials();
+        
+        // Load configuration
         loadConfig();
         
         // Register commands
+        registerCommands();
+        
+        getLogger().info("BonkPotion has been enabled!");
+    }
+    
+    private void initializePotionMaterials() {
+        // Initialize with common potion-related materials
+        String[] potionMaterials = {
+            "POTION", "SPLASH_POTION", "LINGERING_POTION", "TIPPED_ARROW",
+            "WATER_BOTTLE", "GLASS_BOTTLE", "DRAGON_BREATH"
+        };
+        
+        // Add all materials that match our criteria
+        for (Material mat : Material.values()) {
+            String name = mat.name();
+            for (String potionMat : potionMaterials) {
+                if (name.contains(potionMat)) {
+                    POTION_MATERIALS.add(name);
+                    break;
+                }
+            }
+        }
+        
+        // Log the number of potion materials found for debugging
+        getLogger().info("Loaded " + POTION_MATERIALS.size() + " potion-related materials");
+    }
+    
+    private void loadConfig() {
+        saveDefaultConfig();
+        reloadConfig();
+        
+        config = getConfig();
+        config.options().copyDefaults(true);
+        saveConfig();
+        
+        maxPotionsToStack = config.getInt("max-potions-to-stack", 64);
+    }
+    
+    private void registerCommands() {
         Objects.requireNonNull(getCommand("potionstack")).setExecutor((sender, command, label, args) -> {
             if (!(sender instanceof Player)) {
                 sender.sendMessage("This command can only be used by players!");
@@ -51,127 +113,111 @@ public class BonkPotion extends JavaPlugin {
                     return true;
                 }
                 
-                reloadConfig();
                 loadConfig();
                 sender.sendMessage("§aBonkPotion configuration reloaded!");
                 return true;
             }
             
-            sender.sendMessage("§6BonkPotion v" + getDescription().getVersion() + " by " + String.join(", ", getDescription().getAuthors()));
+            sender.sendMessage("§6BonkPotion v" + getDescription().getVersion() + 
+                             " by " + String.join(", ", getDescription().getAuthors()));
             if (sender.hasPermission("bonkpotion.admin")) {
                 sender.sendMessage("§7Use §e/bonkpotion reload §7to reload the configuration.");
             }
             return true;
         });
-        
-        getLogger().info("BonkPotion has been enabled!");
-    }
-    
-    private void loadConfig() {
-        configFile = new File(getDataFolder(), "config.yml");
-        if (!configFile.exists()) {
-            saveResource("config.yml", false);
-        }
-        
-        config = YamlConfiguration.loadConfiguration(configFile);
-        maxPotionsToStack = config.getInt("max-potions-to-stack", 64);
     }
     
     private void stackPotions(Player player) {
         UUID playerId = player.getUniqueId();
         
-        // Prevent multiple simultaneous executions for the same player
-        if (processingPlayers.contains(playerId)) {
+        if (!processingPlayers.add(playerId)) {
             player.sendMessage("§cPlease wait until the current operation is complete!");
             return;
         }
         
-        processingPlayers.add(playerId);
-        
-        // Run the stacking asynchronously
         new BukkitRunnable() {
             @Override
             public void run() {
                 try {
-                    int stacked = stackPlayerPotions(player);
+                    int stacked = processInventory(player);
                     
-                    // Schedule the message to be sent on the main thread
                     Bukkit.getScheduler().runTask(BonkPotion.this, () -> {
                         if (stacked > 0) {
                             player.sendMessage("§aStacked §e" + stacked + " potions§a in your inventory!");
                         } else {
-                            player.sendMessage("§eNo potions to stack found in your inventory!");
+                            player.sendMessage("§eNo stackable potions found in your inventory!");
                         }
                         processingPlayers.remove(playerId);
                     });
                 } catch (Exception e) {
-                    getLogger().warning("Error while stacking potions for " + player.getName() + ": " + e.getMessage());
+                    getLogger().warning("Error processing potion stack: " + e.getMessage());
                     processingPlayers.remove(playerId);
                 }
             }
         }.runTaskAsynchronously(this);
     }
     
-    private int stackPlayerPotions(Player player) {
+    private int processInventory(Player player) {
         Inventory inventory = player.getInventory();
-        Map<ItemStack, List<Integer>> potionMap = new HashMap<>();
+        Map<String, List<ItemStack>> potionMap = new HashMap<>();
         int totalStacked = 0;
-        int remainingPotions = maxPotionsToStack;
+        int remainingPotions = maxPotionsToStack > 0 ? maxPotionsToStack : Integer.MAX_VALUE;
         
-        // First pass: collect all potions and their positions
+        // First pass: collect all potions
         for (int i = 0; i < inventory.getSize(); i++) {
             ItemStack item = inventory.getItem(i);
-            if (item != null && isPotion(item.getType())) {
-                ItemStack key = new ItemStack(item);
-                key.setAmount(1);
-                
-                potionMap.computeIfAbsent(key, k -> new ArrayList<>()).add(i);
+            if (isPotion(item)) {
+                String key = getPotionKey(item);
+                potionMap.computeIfAbsent(key, k -> new ArrayList<>()).add(item);
+            }
+        }
+        
+        // Clear inventory of potions
+        for (int i = 0; i < inventory.getSize(); i++) {
+            ItemStack item = inventory.getItem(i);
+            if (isPotion(item)) {
+                inventory.setItem(i, null);
             }
         }
         
         // Second pass: stack potions
-        for (Map.Entry<ItemStack, List<Integer>> entry : potionMap.entrySet()) {
-            ItemStack potionType = entry.getKey();
-            List<Integer> slots = entry.getValue();
-            
-            if (slots.size() <= 1) continue;
-            
-            int totalAmount = 0;
-            for (int slot : slots) {
-                totalAmount += inventory.getItem(slot).getAmount();
+        for (List<ItemStack> potionGroup : potionMap.values()) {
+            if (potionGroup.size() <= 1) {
+                // Put back single items
+                for (ItemStack item : potionGroup) {
+                    addItemSafely(inventory, item);
+                }
+                continue;
             }
+            
+            int totalAmount = potionGroup.stream().mapToInt(ItemStack::getAmount).sum();
+            ItemStack template = potionGroup.get(0).clone();
             
             // Calculate how many full stacks we can make
             int fullStacks = totalAmount / 16;
             int remainder = totalAmount % 16;
             
-            // Clear all slots first
-            for (int slot : slots) {
-                inventory.setItem(slot, null);
-            }
-            
             // Add full stacks
             int stacksToAdd = Math.min(fullStacks, remainingPotions / 16);
-            if (stacksToAdd > 0) {
-                for (int i = 0; i < stacksToAdd; i++) {
-                    ItemStack stack = potionType.clone();
-                    stack.setAmount(16);
-                    HashMap<Integer, ItemStack> leftover = inventory.addItem(stack);
-                    if (!leftover.isEmpty()) {
-                        break; // No more space
-                    }
+            for (int i = 0; i < stacksToAdd && remainingPotions >= 16; i++) {
+                ItemStack stack = template.clone();
+                stack.setAmount(16);
+                if (addItemSafely(inventory, stack)) {
                     totalStacked += 16;
                     remainingPotions -= 16;
+                } else {
+                    // If we can't add more, stop trying
+                    remainingPotions = 0;
+                    break;
                 }
             }
             
             // Add remainder if there's space and we haven't reached the limit
             if (remainder > 0 && remainingPotions > 0) {
                 int toAdd = Math.min(remainder, remainingPotions);
-                ItemStack stack = potionType.clone();
+                ItemStack stack = template.clone();
                 stack.setAmount(toAdd);
-                HashMap<Integer, ItemStack> leftover = inventory.addItem(stack);
-                if (leftover.isEmpty()) {
+                if (addItemSafely(inventory, stack)) {
                     totalStacked += toAdd;
                     remainingPotions -= toAdd;
                 }
@@ -183,17 +229,108 @@ public class BonkPotion extends JavaPlugin {
         return totalStacked;
     }
     
-    private boolean isPotion(Material material) {
-        String name = material.name().toLowerCase();
-        return name.contains("potion") || name.contains("splash_potion") || name.contains("lingering_potion") || 
-               name.contains("water_bottle") || name.contains("harming") || name.contains("healing") ||
-               name.contains("poison") || name.contains("regeneration") || name.contains("strength") ||
-               name.contains("weakness") || name.contains("slowness") || name.contains("swiftness") ||
-               name.contains("fire_resistance") || name.contains("invisibility") || name.contains("leaping") ||
-               name.contains("night_vision") || name.contains("slow_falling") || name.contains("turtle_master") ||
-               name.contains("water_breathing") || name.contains("luck") || name.contains("unluck") ||
-               name.contains("strong") || name.contains("long") || name.contains("thick") || name.contains("mundane") ||
-               name.contains("awkward") || name.contains("turtle_master") || name.contains("slow_falling");
+    private String getPotionKey(ItemStack item) {
+        StringBuilder key = new StringBuilder(item.getType().name());
+        
+        if (!item.hasItemMeta()) {
+            return key.toString();
+        }
+        
+        ItemMeta meta = item.getItemMeta();
+        if (!(meta instanceof PotionMeta)) {
+            return key.toString();
+        }
+        
+        PotionMeta potionMeta = (PotionMeta) meta;
+        
+        try {
+            // Handle color if available (1.20.5+)
+            try {
+                if (potionMeta.hasColor()) {
+                    key.append(":color:").append(potionMeta.getColor());
+                }
+            } catch (NoSuchMethodError ignored) {
+                // Color method not available in this version
+            }
+            
+            // Handle base potion data (pre-1.20.5)
+            if (getBasePotionDataMethod != null) {
+                try {
+                    Object basePotionData = getBasePotionDataMethod.invoke(potionMeta);
+                    if (basePotionData != null) {
+                        Method getType = basePotionData.getClass().getMethod("getType");
+                        Object type = getType.invoke(basePotionData);
+                        key.append(":base:").append(type);
+                    }
+                } catch (Exception ignored) {
+                    // Method not available or failed
+                }
+            }
+            
+            // Handle custom effects
+            try {
+                Collection<PotionEffect> effects;
+                if (getEffectsMethod != null) {
+                    //noinspection unchecked
+                    effects = (Collection<PotionEffect>) getEffectsMethod.invoke(potionMeta);
+                } else {
+                    effects = potionMeta.getCustomEffects();
+                }
+                
+                if (effects != null && !effects.isEmpty()) {
+                    for (PotionEffect effect : effects) {
+                        key.append(":").append(effect.getType().getName())
+                           .append("-").append(effect.getAmplifier())
+                           .append("-").append(effect.getDuration());
+                    }
+                }
+            } catch (Exception e) {
+                getLogger().log(Level.WARNING, "Failed to get potion effects", e);
+            }
+            
+        } catch (Exception e) {
+            getLogger().log(Level.WARNING, "Error processing potion metadata", e);
+        }
+        
+        return key.toString();
+    }
+    
+    private boolean isPotion(ItemStack item) {
+        if (item == null || !item.hasItemMeta()) return false;
+        
+        Material type = item.getType();
+        String typeName = type.name();
+        
+        // Check if it's a potion, splash potion, lingering potion, or tipped arrow
+        return type == Material.POTION || 
+               type == Material.SPLASH_POTION || 
+               type == Material.LINGERING_POTION ||
+               type == Material.TIPPED_ARROW ||
+               typeName.endsWith("_POTION") ||
+               typeName.endsWith("_SPLASH_POTION") ||
+               typeName.endsWith("_LINGERING_POTION") ||
+               typeName.endsWith("_TIPPED_ARROW");
+    }
+    
+    private boolean addItemSafely(Inventory inventory, ItemStack item) {
+        if (item == null) return false;
+        
+        // Try to add to existing stacks first
+        for (ItemStack content : inventory.getStorageContents()) {
+            if (content != null && content.isSimilar(item) && content.getAmount() < content.getMaxStackSize()) {
+                int space = content.getMaxStackSize() - content.getAmount();
+                int toAdd = Math.min(space, item.getAmount());
+                content.setAmount(content.getAmount() + toAdd);
+                item.setAmount(item.getAmount() - toAdd);
+                
+                if (item.getAmount() <= 0) {
+                    return true;
+                }
+            }
+        }
+        
+        // Add to empty slots
+        return inventory.addItem(item).isEmpty();
     }
     
     @Override
